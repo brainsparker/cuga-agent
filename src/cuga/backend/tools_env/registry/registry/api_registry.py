@@ -17,6 +17,7 @@ from loguru import logger
 from cuga.config import settings
 
 from cuga.backend.tools_env.registry.utils.types import AppDefinition
+from cuga.backend.tools_env.registry.registry.youcom_search import YouComSearchClient
 
 try:
     from tavily import TavilyClient
@@ -38,6 +39,7 @@ class ApiRegistry:
         self.mcp_client = client
         self.auth_manager = None
         self.tavily_client = None
+        self.youcom_client = None
         self._init_tavily_if_enabled()
 
     def _auth_type_for(self, app_name: str) -> Optional[str]:
@@ -77,7 +79,10 @@ class ApiRegistry:
         if self._is_web_search_enabled():
             api_key = os.getenv("TAVILY_API_KEY")
             if not api_key:
-                logger.warning("TAVILY_API_KEY not found in environment. Web search will not work.")
+                # Keyless fallback so enable_web_search works on first run.
+                self.youcom_client = YouComSearchClient()
+                tier = "YDC_API_KEY" if self.youcom_client.keyed else "keyless free tier"
+                logger.info(f"TAVILY_API_KEY not set. Using You.com web search ({tier}).")
                 return
             if TAVILY_AVAILABLE:
                 try:
@@ -87,6 +92,9 @@ class ApiRegistry:
                     logger.error(f"Failed to initialize Tavily client: {e}")
             else:
                 logger.warning("tavily-python package not available. Install it to use web search.")
+
+    def _web_search_backend(self) -> str:
+        return "You.com" if self.youcom_client and not self.tavily_client else "Tavily"
 
     def _is_web_search_enabled(self) -> bool:
         """Check if web search feature is enabled."""
@@ -105,7 +113,11 @@ class ApiRegistry:
 
         if self._is_web_search_enabled():
             app_list.append(
-                AppDefinition(name="web", url=None, description="Web search tool powered by Tavily")
+                AppDefinition(
+                    name="web",
+                    url=None,
+                    description=f"Web search tool powered by {self._web_search_backend()}",
+                )
             )
 
         return app_list
@@ -203,7 +215,7 @@ class ApiRegistry:
                 "api_name": "search_web",
                 "path": "/search_web",
                 "method": "POST",
-                "description": "Search the web using Tavily API. Returns relevant search results with URLs, titles, content, and scores.",
+                "description": f"Search the web using {self._web_search_backend()}. Returns relevant search results with URLs, titles, content, and scores.",
                 "parameters": [
                     {
                         "name": "query",
@@ -219,7 +231,13 @@ class ApiRegistry:
         }
 
     async def _call_web_search(self, query: str) -> Dict[str, Any]:
-        """Call Tavily web search API."""
+        """Call Tavily web search, or You.com when Tavily isn't configured."""
+        if not self.tavily_client and self.youcom_client:
+            try:
+                return await self.youcom_client.search(query)
+            except Exception as e:
+                logger.error(f"Error calling You.com search: {e}")
+                raise
         if not self.tavily_client:
             raise Exception("Tavily client not initialized. Check TAVILY_API_KEY environment variable.")
 
